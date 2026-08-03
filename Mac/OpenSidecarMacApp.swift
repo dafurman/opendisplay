@@ -188,9 +188,7 @@ final class SenderController: ObservableObject {
 
     var running: Bool { !sessions.isEmpty }
 
-    @Published var wifiEnabled: Bool = UserDefaults.standard.object(forKey: "wifiEnabled").map {
-        UserDefaults.standard.bool(forKey: "wifiEnabled")
-    } ?? false {
+    @Published var wifiEnabled: Bool = UserDefaults.standard.bool(forKey: "wifiEnabled") {
         didSet {
             UserDefaults.standard.set(wifiEnabled, forKey: "wifiEnabled")
             if wifiEnabled {
