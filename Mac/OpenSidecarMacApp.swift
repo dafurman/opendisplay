@@ -957,8 +957,14 @@ struct ContentView: View {
 @MainActor
 final class CheckForUpdatesViewModel: ObservableObject {
     @Published var canCheckForUpdates = false
+    @Published var automaticallyChecksForUpdates: Bool {
+        didSet { updater.automaticallyChecksForUpdates = automaticallyChecksForUpdates }
+    }
+    private let updater: SPUUpdater
 
     init(updater: SPUUpdater) {
+        self.updater = updater
+        self.automaticallyChecksForUpdates = updater.automaticallyChecksForUpdates
         updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
     }
@@ -974,6 +980,10 @@ struct CheckForUpdatesView: View {
     }
 
     var body: some View {
+        Toggle("Auto-update", isOn: $viewModel.automaticallyChecksForUpdates)
+            .controlSize(.small)
+            .toggleStyle(.checkbox)
+            .help("Automatically check for and install updates in the background")
         Button("Check for Updates…") { updater.checkForUpdates() }
             .controlSize(.small)
             .disabled(!viewModel.canCheckForUpdates)
