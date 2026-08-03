@@ -86,7 +86,7 @@ enum SenderTransport {
 }
 
 @available(macOS 14.0, *)
-final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
+final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver {
 
     // Status surfaced to the UI (updated on main thread).
     @MainActor var onStatus: ((String) -> Void)?
@@ -178,6 +178,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
     private var inputInjector: InputInjector?
 
+    // Picker flow for extend mode: avoids the Screen Recording TCC prompt by
+    // letting the user select the virtual display via the system share picker.
+    // The chosen filter is cached so reconnects within the session skip the picker.
+    private var pickerContinuation: CheckedContinuation<SCContentFilter, Error>?
+    private var cachedContentFilter: SCContentFilter?
+
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
     private var lastReceived = Date()
@@ -264,21 +270,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             scheduleWatchdog()
         }
 
-        // Screen Recording permission: poll until granted. No auto-prompt at
-        // launch — the permission panel's Grant button triggers the system
-        // dialog, so the request always has visible context.
-        if !CGPreflightScreenCaptureAccess() {
-            await status("Screen Recording permission needed — see Permissions below")
-            Log.info("Screen Recording permission missing — waiting for grant via the permission panel")
-            while !CGPreflightScreenCaptureAccess() {
-                try await Task.sleep(for: .seconds(2))
-                if stopped { return }
-            }
-            Log.info("Screen Recording permission granted")
-        }
-
         switch mode {
         case .mirror:
+            // Mirror captures the main display directly — requires Screen Recording.
+            if !CGPreflightScreenCaptureAccess() {
+                await status("Screen Recording permission needed — see Permissions below")
+                Log.info("Screen Recording permission missing — waiting for grant via the permission panel")
+                while !CGPreflightScreenCaptureAccess() {
+                    try await Task.sleep(for: .seconds(2))
+                    if stopped { return }
+                }
+                Log.info("Screen Recording permission granted")
+            }
             let content = try await SCShareableContent.current
             guard let display = content.displays.first else {
                 throw NSError(domain: "MacSender", code: 1,
@@ -287,7 +290,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // SCDisplay reports points; capture at point resolution for M1.
             let captureW = (Int(Double(display.width) * quality.scale)) & ~1
             let captureH = (Int(Double(display.height) * quality.scale)) & ~1
-            try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
+            try await startCapture(filter: SCContentFilter(display: display, excludingWindows: []),
+                                   displayID: display.displayID,
+                                   pixelsWide: captureW, pixelsHigh: captureH)
 
         case .extend:
             // awaitingWake is queue-confined — read it there before surfacing.
@@ -386,12 +391,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         virtualDisplay = vd
         inputInjector = InputInjector(displayID: vd.displayID)
 
-        let display = try await findSCDisplay(id: vd.displayID)
         // Quality scaling: capture/encode below native when requested — the
         // display itself stays native so window layout is unaffected.
         let captureW = (Int(Double(pointsWide * 2) * quality.scale)) & ~1
         let captureH = (Int(Double(pointsHigh * 2) * quality.scale)) & ~1
-        try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
+
+        // Use the system share picker to get a content filter for the virtual
+        // display — avoids the Screen Recording TCC grant. On reconnect within
+        // the same session the cached filter is reused so the user isn't asked
+        // again. The virtual display must be registered with the picker so it
+        // appears as a selectable item; we exclude it from the picker's default
+        // "exclude from pickers" list by passing its display ID as an included
+        // display.
+        let filter: SCContentFilter
+        if let cached = cachedContentFilter {
+            filter = cached
+        } else {
+            await status("Select the \"\(displayName)\" display in the share picker…")
+            filter = try await pickContentFilter(for: vd.displayID)
+            cachedContentFilter = filter
+        }
+        try await startCapture(filter: filter, displayID: vd.displayID, pixelsWide: captureW, pixelsHigh: captureH)
 
         // Debug aid (`defaults write sh.peet.opensidecar.mac testPattern -bool true`):
         // an animated window on the virtual display generates a constant frame
@@ -436,20 +456,54 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     /// The virtual display takes a moment to show up in shareable content.
-    private func findSCDisplay(id: CGDirectDisplayID) async throws -> SCDisplay {
-        for _ in 0..<20 {
-            let content = try await SCShareableContent.current
-            if let display = content.displays.first(where: { $0.displayID == id }) {
-                return display
-            }
-            try await Task.sleep(for: .milliseconds(250))
+    /// Present the system share picker and resolve once the user selects the
+    /// virtual display. Registers as observer, shows the picker, then suspends
+    /// until `contentSharingPicker(_:didUpdateWith:for:)` fires.
+    private func pickContentFilter(for displayID: CGDirectDisplayID) async throws -> SCContentFilter {
+        let picker = SCContentSharingPicker.shared
+        picker.add(self)
+        var config = SCContentSharingPickerConfiguration()
+        config.allowedPickerModes = [.singleDisplay]
+        picker.defaultConfiguration = config
+        picker.isActive = true
+        await MainActor.run { picker.present() }
+        return try await withCheckedThrowingContinuation { continuation in
+            queue.async { self.pickerContinuation = continuation }
         }
-        throw NSError(domain: "MacSender", code: 3,
-                      userInfo: [NSLocalizedDescriptionKey: "virtual display never appeared in SCShareableContent"])
     }
 
-    private func startCapture(display: SCDisplay, pixelsWide: Int, pixelsHigh: Int) async throws {
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+    // MARK: - SCContentSharingPickerObserver
+
+    func contentSharingPicker(_ picker: SCContentSharingPicker,
+                              didUpdateWith filter: SCContentFilter,
+                              for stream: SCStream?) {
+        picker.remove(self)
+        queue.async {
+            self.pickerContinuation?.resume(returning: filter)
+            self.pickerContinuation = nil
+        }
+    }
+
+    func contentSharingPicker(_ picker: SCContentSharingPicker,
+                              didCancelFor stream: SCStream?) {
+        picker.remove(self)
+        queue.async {
+            self.pickerContinuation?.resume(
+                throwing: NSError(domain: "MacSender", code: 4,
+                                  userInfo: [NSLocalizedDescriptionKey: "share picker cancelled"]))
+            self.pickerContinuation = nil
+        }
+    }
+
+    func contentSharingPickerStartDidFailWithError(_ error: any Error) {
+        SCContentSharingPicker.shared.remove(self)
+        queue.async {
+            self.pickerContinuation?.resume(throwing: error)
+            self.pickerContinuation = nil
+        }
+    }
+
+    private func startCapture(filter: SCContentFilter, displayID: CGDirectDisplayID, pixelsWide: Int, pixelsHigh: Int) async throws {
 
         let config = SCStreamConfiguration()
         config.width = pixelsWide
@@ -474,11 +528,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try await stream.startCapture()
         self.stream = stream
-        captureDisplayID = display.displayID
+        captureDisplayID = displayID
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         lastCursorSent = (-1, -1, false)
         startCursorEcho()
-        Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) mode \(mode.rawValue) localCursor=\(localCursor)")
+        Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(captureDisplayID) mode \(mode.rawValue) localCursor=\(localCursor)")
         let kind = lastHello?.kind ?? "device"
         await status("\(mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
     }
@@ -496,10 +550,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         virtualDisplay = nil   // releasing it removes the display
+        SCContentSharingPicker.shared.remove(self)
         queue.async { [weak self] in
-            // Unblock a start() that is still waiting for the hello.
             self?.helloContinuation?.resume(throwing: CancellationError())
             self?.helloContinuation = nil
+            self?.pickerContinuation?.resume(throwing: CancellationError())
+            self?.pickerContinuation = nil
+            self?.cachedContentFilter = nil
         }
     }
 

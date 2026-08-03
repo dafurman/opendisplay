@@ -875,13 +875,15 @@ struct ContentView: View {
                 .help("Opens System Settings → Displays, where you can position the extended displays relative to your Mac screen (Arrange…). Each device shows up as its own display, named after the device.")
 
                 Section("Permissions") {
-                    permissionRow(
-                        "Screen Recording",
-                        granted: permissions.screenRecording,
-                        help: "Required to capture the display.",
-                        anchor: "Privacy_ScreenCapture",
-                        request: { permissions.requestScreenRecording() }
-                    )
+                    if controller.mode == .mirror {
+                        permissionRow(
+                            "Screen Recording",
+                            granted: permissions.screenRecording,
+                            help: "Required to capture the display in Mirror mode. Extend mode uses the system share picker instead.",
+                            anchor: "Privacy_ScreenCapture",
+                            request: { permissions.requestScreenRecording() }
+                        )
+                    }
                     permissionRow(
                         "Accessibility",
                         granted: permissions.accessibility,
