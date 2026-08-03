@@ -188,6 +188,22 @@ final class SenderController: ObservableObject {
 
     var running: Bool { !sessions.isEmpty }
 
+    @Published var wifiEnabled: Bool = UserDefaults.standard.object(forKey: "wifiEnabled").map {
+        UserDefaults.standard.bool(forKey: "wifiEnabled")
+    } ?? false {
+        didSet {
+            UserDefaults.standard.set(wifiEnabled, forKey: "wifiEnabled")
+            if wifiEnabled {
+                startBrowsing()
+            } else {
+                browser?.cancel()
+                browser = nil
+                sessions.filter { !$0.onUSB }.forEach { disconnect($0) }
+                discovered = []
+            }
+        }
+    }
+
     private var browser: NWBrowser?
     private var usbWatcher: UsbmuxDeviceWatcher?
 
@@ -232,7 +248,7 @@ final class SenderController: ObservableObject {
     private let wifiAutoConnectDeadline = Date().addingTimeInterval(12)
 
     init() {
-        startBrowsing()
+        if wifiEnabled { startBrowsing() }
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             guard let self else { return }
             let detached = Set(self.usbDevices.map(\.udid)).subtracting(devices.map(\.udid))
@@ -370,7 +386,7 @@ final class SenderController: ObservableObject {
     /// service if one is visible. Without one the session keeps its normal
     /// fate — retry over USB through the grace period, then end.
     private func failover(detachedUDIDs: Set<String>) {
-        guard autoConnectEnabled, !detachedUDIDs.isEmpty else { return }
+        guard autoConnectEnabled, wifiEnabled, !detachedUDIDs.isEmpty else { return }
         for session in sessions where session.onUSB {
             guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
                   let result = wifiService(for: session) else { continue }
@@ -832,6 +848,9 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Toggle("WiFi mode", isOn: $controller.wifiEnabled)
+                    .help("Discover and connect to devices over WiFi (Bonjour). Disable to restrict to USB only — no LAN traffic.")
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Show app in", selection: $controller.presentation) {
