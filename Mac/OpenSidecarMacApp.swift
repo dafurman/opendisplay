@@ -188,9 +188,7 @@ final class SenderController: ObservableObject {
 
     var running: Bool { !sessions.isEmpty }
 
-    @Published var wifiEnabled: Bool = UserDefaults.standard.object(forKey: "wifiEnabled").map {
-        UserDefaults.standard.bool(forKey: "wifiEnabled")
-    } ?? false {
+    @Published var wifiEnabled: Bool = UserDefaults.standard.bool(forKey: "wifiEnabled") {
         didSet {
             UserDefaults.standard.set(wifiEnabled, forKey: "wifiEnabled")
             if wifiEnabled {
@@ -386,7 +384,7 @@ final class SenderController: ObservableObject {
     /// service if one is visible. Without one the session keeps its normal
     /// fate — retry over USB through the grace period, then end.
     private func failover(detachedUDIDs: Set<String>) {
-        guard autoConnectEnabled, wifiEnabled, !detachedUDIDs.isEmpty else { return }
+        guard autoConnectEnabled, !detachedUDIDs.isEmpty else { return }
         for session in sessions where session.onUSB {
             guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
                   let result = wifiService(for: session) else { continue }
@@ -481,6 +479,7 @@ final class SenderController: ObservableObject {
 
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false) {
+        if case .wifi = target, !wifiEnabled { return }
         let id = target.sessionID
         guard session(for: id) == nil else { return }
 
@@ -986,6 +985,8 @@ final class CheckForUpdatesViewModel: ObservableObject {
         self.automaticallyChecksForUpdates = updater.automaticallyChecksForUpdates
         updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
+        updater.publisher(for: \.automaticallyChecksForUpdates)
+            .assign(to: &$automaticallyChecksForUpdates)
     }
 }
 
